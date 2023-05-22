@@ -1,0 +1,31 @@
+diff --git a/05_prethreaded/main.c b/05_prethreaded/main.c
+old mode 100644
+new mode 100755
+index 173eb20..1f99d1a
+--- a/05_prethreaded/main.c
++++ b/05_prethreaded/main.c
+@@ -407,13 +407,22 @@ void handle_http_404(int client_socket) {
+  * and write it over the client socket using Linux's sendfile() system call. This saves us
+  * the hassle of transferring file buffers from kernel to user space and back.
+  * */
++int fd;
++char *buf;
+
+ void transfer_file_contents(char *file_path, int client_socket, off_t file_size) {
+-    int fd;
+
++    if(!fd){
++    buf = malloc(file_size);
+     fd = open(file_path, O_RDONLY);
+-    sendfile(client_socket, fd, NULL, file_size);
++    if (fd < 0)
++        fatal_error("read");
++
++    /* We should really check for short reads here */
++    int ret = read(fd, buf, file_size);
+     close(fd);
++    }
++    send(client_socket, buf, file_size, 0);
+ }
+
+ /*
