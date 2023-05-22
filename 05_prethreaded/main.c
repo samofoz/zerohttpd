@@ -407,13 +407,22 @@ void handle_http_404(int client_socket) {
  * and write it over the client socket using Linux's sendfile() system call. This saves us
  * the hassle of transferring file buffers from kernel to user space and back.
  * */
+int fd;
+char *buf;
 
 void transfer_file_contents(char *file_path, int client_socket, off_t file_size) {
-    int fd;
 
+    if(!fd){
+    buf = malloc(file_size);
     fd = open(file_path, O_RDONLY);
-    sendfile(client_socket, fd, NULL, file_size);
+    if (fd < 0)
+        fatal_error("read");
+
+    /* We should really check for short reads here */
+    int ret = read(fd, buf, file_size);
     close(fd);
+    }
+    send(client_socket, buf, file_size, 0);
 }
 
 /*
@@ -863,7 +872,7 @@ void handle_client(int client_socket)
  * connections and calls handle_client() to serve the request. Once the request is served,
  * it closes the client connection and goes back to waiting for a new client connection,
  * calling accept() again.
- * Here, the call to accept() is protected with a mutex so that only one thread in the 
+ * Here, the call to accept() is protected with a mutex so that only one thread in the
  * thread pool can actually be blocked in accept(). This is to avoid the thundering herd
  * problem that supposedly affects some versions of Unix operating systems.
  * */
@@ -918,7 +927,7 @@ void print_stats(int signo) {
 
 /*
  * Our main function is fairly simple. I sets up the listening socket and then
- * crates THREAD_COUNT number of threads to handle incoming requests. The main 
+ * crates THREAD_COUNT number of threads to handle incoming requests. The main
  * thread does nothing, just calling pause() in an infinite loop.
  * */
 
@@ -949,4 +958,3 @@ int main(int argc, char *argv[])
     for (;;)
         pause();
 }
-
