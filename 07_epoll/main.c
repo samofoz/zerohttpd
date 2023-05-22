@@ -913,7 +913,7 @@ void handle_get_method(char *path, int client_sock)
         {
             send_headers(final_path, path_stat.st_size, client_sock);
             transfer_file_contents(final_path, client_sock, path_stat.st_size);
-            printf("200 %s %ld bytes\n", final_path, path_stat.st_size);
+            //printf("200 %s %ld bytes\n", final_path, path_stat.st_size);
         }
         else
         {
@@ -921,6 +921,7 @@ void handle_get_method(char *path, int client_sock)
             printf("404 Not Found: %s\n", final_path);
         }
     }
+    close(client_sock);
 }
 
 /*
@@ -1077,9 +1078,9 @@ void handle_client(int client_sock)
 
     while (1)
     {
-        get_line(client_sock, line_buffer, sizeof(line_buffer));
+        if(0 == get_line(client_sock, line_buffer, sizeof(line_buffer)) && !method_line)
+            return;
         method_line++;
-
         unsigned long len = strlen(line_buffer);
 
         /*
@@ -1100,7 +1101,6 @@ void handle_client(int client_sock)
                 break;
         }
     }
-
     handle_http_method(method_buffer, client_sock);
 }
 
@@ -1142,33 +1142,36 @@ _Noreturn void enter_server_loop(int server_socket)
             if (events[i].events == 0)
                 continue;
 
-            int client_socket = accept(
-                    server_socket,
-                    (struct sockaddr *)&client_addr,
-                    &client_addr_len);
+            if (events[i].data.fd == server_socket) {
+                int client_socket = accept(
+                        server_socket,
+                        (struct sockaddr *)&client_addr,
+                        &client_addr_len);
 
-            if (client_socket > 0 ) {
-                handle_client(client_socket);
+                if (client_socket > 0 ) {
+                     add_to_epoll_fd_list(client_socket, EPOLLIN);
+                }
             }
-
-            if (events[i].data.fd != server_socket) {
+            else {
                 if (!((events[i].events & EPOLLIN)||(events[i].events & EPOLLOUT))) {
                     printf("ERROR: Error condition in socket %d!\n", events[i].data.fd);
                     exit(1);
                     continue;
                 }
-                /* A descriptor handling one of the clients is ready */
+                handle_client(events[i].data.fd);
+                /* A descriptor handling one of the clients is ready
                 client_context *check_cc;
                 HASH_FIND(hh_cs, cc_cs_hash, &events[i].data.fd, sizeof(int), check_cc);
                 if (!check_cc) {
                     HASH_FIND(hh_rs, cc_rs_hash, &events[i].data.fd, sizeof(int), check_cc);
                     if (!check_cc) {
                         printf("Unable to find client context associated with socket %d.\n", events[i].data.fd);
-	            		exit(1);
+                                exit(1);
                     }
 
                 }
                 check_cc->read_write_callback(check_cc);
+                */
             }
         }
     }
@@ -1224,8 +1227,8 @@ void print_stats(int signo) {
 
 
 /*
- * Our main function is fairly simple. I sets up the listening socket, sets up 
- * a signal handler for SIGINT, creates a epoll descriptor and finally calls 
+ * Our main function is fairly simple. I sets up the listening socket, sets up
+ * a signal handler for SIGINT, creates a epoll descriptor and finally calls
  * enter_server_loop(), which starts our main event loop based on epoll_wait()
  * */
 
