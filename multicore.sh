@@ -4,11 +4,12 @@ trap "kill 0" SIGINT
 
 #### Default Configuration
 
-CONCURRENCY=20000
+CONNPERTHREAD=10000
 REQUESTS=1
 ADDRESS="http://localhost:8000/"
-PROCESSES=$(nproc)/2
-NAME=webserver_liburing
+THREADS=$(nproc)/2
+NAME=liburing
+PROCESSES=1
 
 show_help() {
 cat << EOF
@@ -30,19 +31,22 @@ EOF
 
 #### CLI
 
-while getopts ":a:c:r:n:p:h" opt; do
+while getopts ":a:c:r:n:t:p:h" opt; do
   case $opt in
     a)
       ADDRESS=$OPTARG
       ;;
     c)
-      CONCURRENCY=$OPTARG
+      CONNPERTHREAD=$OPTARG
       ;;
     r)
       REQUESTS=$OPTARG
       ;;
     n)
       NAME=$OPTARG
+      ;;
+    t)
+      THREADS=$OPTARG
       ;;
     p)
       PROCESSES=$OPTARG
@@ -65,7 +69,7 @@ shift $((OPTIND-1))
 
 for i in `seq 1 $PROCESSES`; do
   let PORT=8000+i
-  ./$NAME $PORT & pidlist="$pidlist $!"
+  ./$NAME $PORT $THREADS $CONNPERTHREAD & pidlist="$pidlist $!"
 done
 
 # Execute and wait
