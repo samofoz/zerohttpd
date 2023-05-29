@@ -664,7 +664,7 @@ void handle_get_method(char *path, int client_socket)
         {
             send_headers(final_path, path_stat.st_size, client_socket);
             transfer_file_contents(final_path, client_socket, path_stat.st_size);
-            printf("200 %s %ld bytes\n", final_path, path_stat.st_size);
+            //printf("200 %s %ld bytes\n", final_path, path_stat.st_size);
         }
         else
         {
