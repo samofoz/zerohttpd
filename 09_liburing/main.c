@@ -153,6 +153,11 @@ int setup_listening_socket(int port) {
                    SOL_SOCKET, SO_REUSEADDR,
                    &enable, sizeof(int)) < 0)
         fatal_error("setsockopt(SO_REUSEADDR)");
+    enable = 1;
+    if (setsockopt(sock,
+                   SOL_SOCKET, SO_REUSEPORT,
+                   &enable, sizeof(int)) < 0)
+        fatal_error("setsockopt(SO_REUSEADDR)");
 
 
     memset(&srv_addr, 0, sizeof(srv_addr));
@@ -168,7 +173,7 @@ int setup_listening_socket(int port) {
              sizeof(srv_addr)) < 0)
         fatal_error("bind()");
 
-    if (listen(sock, 15000) < 0)
+    if (listen(sock, 40000) < 0)
         fatal_error("listen()");
 
     return (sock);
@@ -523,7 +528,15 @@ int main(int argc, char*argv[]) {
     int server_socket = setup_listening_socket(server_port);
     printf("ZeroHTTPd listening on port: %d\n", server_port);
 
+    /*
+    struct io_uring_params params;
+    memset(&params, 0, sizeof(params));
+    params.flags |= IORING_SETUP_SQPOLL;
+    params.sq_thread_idle = 500;
+    */
+
     signal(SIGINT, sigint_handler);
+    //io_uring_queue_init_params(QUEUE_DEPTH, &ring, &params);
     io_uring_queue_init(QUEUE_DEPTH, &ring, 0);
     server_loop(server_socket);
 
