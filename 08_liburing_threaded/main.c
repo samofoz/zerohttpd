@@ -12,7 +12,6 @@
 #include <sys/utsname.h>
 #include <sys/time.h>
 #include <pthread.h>
-#include "uthash.h"
 #include "mpscq.h"
 
 #define SERVER_STRING                   "Server: zerohttpd/0.1\r\n"
@@ -21,7 +20,6 @@
 #define READ_SZ                         8192
 #define MAX_THREADS                     128
 #define MAX_SOCKETS                     14000*MAX_THREADS
-#define SUBMIT_IN_SPERATE_THREAD        1
 
 #define EVENT_TYPE_ACCEPT       0
 #define EVENT_TYPE_READ         1
@@ -33,10 +31,18 @@
 int server_port = DEFAULT_SERVER_PORT;
 int total_threads = MAX_THREADS;
 int total_sockets = MAX_SOCKETS;
-int server_socket = -1;
+int *server_socket;
 
 struct io_uring *client_ring;
-struct mpscq **liburing_queues;
+
+int fd;
+char *buf;
+struct stat path_stat;
+
+unsigned long long connections;
+unsigned long long concurrent;
+unsigned long long total;
+pthread_mutex_t lock;
 
 struct request {
     int event_type;
@@ -120,8 +126,7 @@ int check_kernel_version() {
 }
 
 void check_for_index_file() {
-    struct stat st;
-    int ret = stat("public/index.html", &st);
+    int ret = stat("public/index.html", &path_stat);
     if(ret < 0 ) {
         fprintf(stderr, "ZeroHTTPd needs the \"public\" directory to be "
                 "present in the current directory.\n");
@@ -165,16 +170,16 @@ int setup_listening_socket(int port) {
 
     int enable = 1;
     if (setsockopt(sock,
-                   SOL_SOCKET, SO_REUSEADDR,
-                   &enable, sizeof(int)) < 0)
-        fatal_error("setsockopt(SO_REUSEADDR)");
-
-    enable = 1;
-    if (setsockopt(sock,
                    SOL_SOCKET, SO_REUSEPORT,
                    &enable, sizeof(int)) < 0)
         fatal_error("setsockopt(SO_REUSEPORT)");
-
+/*
+    enable = 1;
+    if (setsockopt(sock,
+                   SOL_SOCKET, SO_REUSEADDR,
+                   &enable, sizeof(int)) < 0)
+        fatal_error("setsockopt(SO_REUSEADDR)");
+*/
     memset(&srv_addr, 0, sizeof(srv_addr));
     srv_addr.sin_family = AF_INET;
     srv_addr.sin_port = htons(port);
@@ -188,38 +193,26 @@ int setup_listening_socket(int port) {
              sizeof(srv_addr)) < 0)
         fatal_error("bind()");
 
-    if (listen(sock, 20000) < 0)
+    if (listen(sock, 2000) < 0)
         fatal_error("listen()");
 
     return (sock);
 }
 
 int add_accept_request(int server_socket, struct sockaddr_in *client_addr,
-                       socklen_t *client_addr_len) {
-#if SUBMIT_IN_SPERATE_THREAD
-    struct io_uring_sqe *sqe = malloc(sizeof(struct io_uring_sqe));
-#else
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&client_ring[total_threads]);
-#endif
+                       socklen_t *client_addr_len, int queue) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&client_ring[queue]);
     io_uring_prep_accept(sqe, server_socket, (struct sockaddr *) client_addr,
                          client_addr_len, SOCK_NONBLOCK);
     struct request *req = malloc(sizeof(*req));
     req->event_type = EVENT_TYPE_ACCEPT;
     io_uring_sqe_set_data(sqe, req);
-#if SUBMIT_IN_SPERATE_THREAD
-    mpscq_enqueue(liburing_queues[total_threads], sqe);
-#else
-    io_uring_submit(&client_ring[total_threads]);
-#endif
+    io_uring_submit(&client_ring[queue]);
     return 0;
 }
 
-int add_read_request(int client_socket) {
-#if SUBMIT_IN_SPERATE_THREAD
-    struct io_uring_sqe *sqe = malloc(sizeof(struct io_uring_sqe));
-#else
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&client_ring[client_socket % total_threads]);
-#endif
+int add_read_request(int client_socket, int queue) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&client_ring[queue]);
     struct request *req = malloc(sizeof(*req) + sizeof(struct iovec));
     req->iov[0].iov_base = malloc(READ_SZ);
     req->iov[0].iov_len = READ_SZ;
@@ -229,32 +222,20 @@ int add_read_request(int client_socket) {
     /* Linux kernel 5.5 has support for readv, but not for recv() or read() */
     io_uring_prep_readv(sqe, client_socket, &req->iov[0], 1, 0);
     io_uring_sqe_set_data(sqe, req);
-#if SUBMIT_IN_SPERATE_THREAD
-    mpscq_enqueue(liburing_queues[client_socket % total_threads], sqe);
-#else
-    io_uring_submit(&client_ring[client_socket % total_threads]);
-#endif
+    io_uring_submit(&client_ring[queue]);
     return 0;
 }
 
-int add_write_request(struct request *req, int client_socket) {
-#if SUBMIT_IN_SPERATE_THREAD
-    struct io_uring_sqe *sqe = malloc(sizeof(struct io_uring_sqe));
-#else
-    struct io_uring_sqe *sqe = io_uring_get_sqe(&client_ring[client_socket % total_threads]);
-#endif
+int add_write_request(struct request *req, int client_socket, int queue) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&client_ring[queue]);
     req->event_type = EVENT_TYPE_WRITE;
     io_uring_prep_writev(sqe, req->client_socket, req->iov, req->iovec_count, 0);
     io_uring_sqe_set_data(sqe, req);
-#if SUBMIT_IN_SPERATE_THREAD
-    mpscq_enqueue(liburing_queues[client_socket % total_threads], sqe);
-#else
-    io_uring_submit(&client_ring[client_socket % total_threads]);
-#endif
+    io_uring_submit(&client_ring[queue]);
     return 0;
 }
 
-void _send_static_string_content(const char *str, int client_socket) {
+void _send_static_string_content(const char *str, int client_socket, int queue) {
     struct request *req = zh_malloc(sizeof(*req) + sizeof(struct iovec));
     unsigned long slen = strlen(str);
     req->iovec_count = 1;
@@ -262,7 +243,7 @@ void _send_static_string_content(const char *str, int client_socket) {
     req->iov[0].iov_base = zh_malloc(slen);
     req->iov[0].iov_len = slen;
     memcpy(req->iov[0].iov_base, str, slen);
-    add_write_request(req, client_socket);
+    add_write_request(req, client_socket, queue);
 }
 
 /*
@@ -270,8 +251,8 @@ void _send_static_string_content(const char *str, int client_socket) {
  * is used to inform the client.
  * */
 
-void handle_unimplemented_method(int client_socket) {
-    _send_static_string_content(unimplemented_content, client_socket);
+void handle_unimplemented_method(int client_socket, int queue) {
+    _send_static_string_content(unimplemented_content, client_socket, queue);
 }
 
 /*
@@ -279,8 +260,8 @@ void handle_unimplemented_method(int client_socket) {
  * case the file requested is not found.
  * */
 
-void handle_http_404(int client_socket) {
-    _send_static_string_content(http_404_content, client_socket);
+void handle_http_404(int client_socket, int queue) {
+    _send_static_string_content(http_404_content, client_socket, queue);
 }
 
 /*
@@ -288,24 +269,24 @@ void handle_http_404(int client_socket) {
  * and write it over the client socket using Linux's sendfile() system call. This saves us
  * the hassle of transferring file buffers from kernel to user space and back.
  * */
-int fd;
-char *buf;
-
-void copy_file_contents(char *file_path, off_t file_size, struct iovec *iov) {
+void open_index_file(char *file_path) {
     if(!fd){
-    buf = zh_malloc(file_size);
+    buf = zh_malloc(path_stat.st_size);
     fd = open(file_path, O_RDONLY);
     if (fd < 0)
         fatal_error("read");
 
     /* We should really check for short reads here */
-    int ret = read(fd, buf, file_size);
-    if (ret < file_size) {
+    int ret = read(fd, buf, path_stat.st_size);
+    if (ret < path_stat.st_size) {
         fprintf(stderr, "Encountered a short read.\n");
     }
     close(fd);
     }
+}
 
+
+void copy_file_contents(char *file_path, off_t file_size, struct iovec *iov) {
     iov->iov_base = buf;
     iov->iov_len = file_size;
 }
@@ -392,8 +373,7 @@ void send_headers(const char *path, off_t len, struct iovec *iov) {
     iov[4].iov_len = slen;
     memcpy(iov[4].iov_base, send_buffer, slen);
 }
-struct stat path_stat;
-void handle_get_method(char *path, int client_socket) {
+void handle_get_method(char *path, int client_socket, int queue) {
     char final_path[1024];
 
     /*
@@ -412,12 +392,6 @@ void handle_get_method(char *path, int client_socket) {
 
     /* The stat() system call will give you information about the file
      * like type (regular file, directory, etc), size, etc. */
-    if(!path_stat.st_size){
-    if (stat(final_path, &path_stat) == -1) {
-        printf("404 Not Found: %s (%s)\n", final_path, path);
-        handle_http_404(client_socket);
-    }
-    }
     {
         /* Check if this is a normal/regular file and not a directory or something else */
         if (S_ISREG(path_stat.st_mode)) {
@@ -427,10 +401,10 @@ void handle_get_method(char *path, int client_socket) {
             send_headers(final_path, path_stat.st_size, req->iov);
             copy_file_contents(final_path, path_stat.st_size, &req->iov[5]);
             //printf("200 %s %ld bytes\n", final_path, path_stat.st_size);
-            add_write_request( req, client_socket);
+            add_write_request( req, client_socket, queue);
         }
         else {
-            handle_http_404(client_socket);
+            handle_http_404(client_socket, queue);
             printf("404 Not Found: %s\n", final_path);
         }
     }
@@ -442,7 +416,7 @@ void handle_get_method(char *path, int client_socket) {
  * in case both these don't match. This sends an error to the client.
  * */
 
-void handle_http_method(char *method_buffer, int client_socket) {
+void handle_http_method(char *method_buffer, int client_socket, int queue) {
     char *method, *path, *saveptr;
 
     method = strtok_r(method_buffer, " ", &saveptr);
@@ -450,10 +424,10 @@ void handle_http_method(char *method_buffer, int client_socket) {
     path = strtok_r(NULL, " ", &saveptr);
 
     if (strcmp(method, "get") == 0) {
-        handle_get_method(path, client_socket);
+        handle_get_method(path, client_socket, queue);
     }
     else {
-        handle_unimplemented_method(client_socket);
+        handle_unimplemented_method(client_socket, queue);
     }
 }
 
@@ -468,65 +442,29 @@ int get_line(const char *src, char *dest, int dest_sz) {
     return 1;
 }
 
-int handle_client_request(struct request *req) {
+int handle_client_request(struct request *req, int queue) {
     char http_request[1024];
     /* Get the first line, which will be the request */
     if(get_line(req->iov[0].iov_base, http_request, sizeof(http_request))) {
         fprintf(stderr, "Malformed request\n");
         exit(1);
     }
-    handle_http_method(http_request, req->client_socket);
+    handle_http_method(http_request, req->client_socket, queue);
     return 0;
 }
 
 
-#if 0
-void server_loop() {
-    struct io_uring_cqe *cqe;
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
 
-    add_accept_request(server_socket, &client_addr, &client_addr_len);
-
-    while (1) {
-        int ret = io_uring_wait_cqe(&ring, &cqe);
-        if (ret < 0)
-            fatal_error("io_uring_wait_cqe");
-        if (cqe->res < 0) {
-            struct request *req = (struct request *) cqe->user_data;
-            fprintf(stderr, "Async request failed: %s for event: %d\n",
-                    strerror(-cqe->res), req->event_type);
-            close(req->client_socket);
-            free(req);
-            continue;
-        }
-
-        struct client_event *cv = (struct client_event *)malloc(sizeof(struct client_event *));
-        cv->res = cqe->res;
-        cv->req = (struct request *) cqe->user_data;
-
-        /* Queue this request to the appropriate thread */
-        mpscq_enqueue(thread_queues[(cqe->res%total_threads)], cv);
-
-        /* Mark this request as processed */
-        io_uring_cqe_seen(&ring, cqe);
-    }
-}
-#endif
-
-void sigint_handler(int signo) {
-    printf("^C pressed. Shutting down.\n");
-    for(int i = 0; i <= total_threads; ++i)
-        io_uring_queue_exit(&client_ring[i]);
-    exit(0);
-}
-
-void *client_thread(void *p) {
-    int i = (int)(intptr_t)p;
+void server_loop(int i) {
+    int port = server_port;// + i;
     struct io_uring_cqe *cqe;
     struct sockaddr_in client_addr;
     socklen_t client_addr_len = sizeof(client_addr);
     int conns = 0;
+
+    server_socket[i] = setup_listening_socket(port);
+    add_accept_request(server_socket[i], &client_addr, &client_addr_len, i);
+    printf("ZeroHTTPd[%d] listening on port: %d\n", i, port);
 
     while(1){
         int ret = io_uring_wait_cqe(&client_ring[i], &cqe);
@@ -538,6 +476,13 @@ void *client_thread(void *p) {
             fprintf(stderr, "Async request failed: %s for event: %d\n",
                     strerror(-cqe->res), req->event_type);
             close(req->client_socket);
+            pthread_mutex_lock(&lock);
+            connections--;
+            if(!connections) {
+                fprintf(stderr, "Total connections [%lld], Max Concurrent [%lld]\n", total, concurrent);
+                total = concurrent = 0;
+            }
+            pthread_mutex_unlock(&lock);
             free(req);
             io_uring_cqe_seen(&client_ring[i], cqe);
             continue;
@@ -545,34 +490,78 @@ void *client_thread(void *p) {
         switch (req->event_type) {
             case EVENT_TYPE_ACCEPT:
                 //fprintf(stderr, "New connection received on ring [%d], count [%d]\n", i, ++conns);
-                add_accept_request(server_socket, &client_addr, &client_addr_len);
-                add_read_request(cqe->res);
+                pthread_mutex_lock(&lock);
+                connections++;
+                total++;
+                if(connections > concurrent)
+                    concurrent = connections;
+                pthread_mutex_unlock(&lock);
+                add_accept_request(server_socket[i], &client_addr, &client_addr_len, i);
+                add_read_request(cqe->res, i);
                 break;
             case EVENT_TYPE_READ:
                 if (!cqe->res) {
+                    //fprintf(stderr, "Connection terminated on ring [%d], count [%d]\n", i, --conns);
                     close(req->client_socket);
+                    pthread_mutex_lock(&lock);
+                    connections--;
+                    if(!connections) {
+                        fprintf(stderr, "Total connections [%lld], Max Concurrent [%lld]\n", total, concurrent);
+                        total = concurrent = 0;
+                    }
+                    pthread_mutex_unlock(&lock);
                     break;
                 }
-                handle_client_request(req);
+                handle_client_request(req, i);
                 free(req->iov[0].iov_base);
                 break;
             case EVENT_TYPE_WRITE:
                 for (int i = 0; i < req->iovec_count-1; i++) {
                     free(req->iov[i].iov_base);
                 }
+                //fprintf(stderr, "Connection terminated on ring [%d], count [%d]\n", i, --conns);
                 close(req->client_socket);
+                pthread_mutex_lock(&lock);
+                connections--;
+                if(!connections) {
+                    fprintf(stderr, "Total connections [%lld], Max Concurrent [%lld]\n", total, concurrent);
+                    total = concurrent = 0;
+                }
+                pthread_mutex_unlock(&lock);
                 break;
             default:
                 fprintf(stderr, "Unknown event! [%d]\n", req->event_type);
                 close(req->client_socket);
+                pthread_mutex_lock(&lock);
+                connections--;
+                if(!connections) {
+                    fprintf(stderr, "Total connections [%lld], Max Concurrent [%lld]\n", total, concurrent);
+                    total = concurrent = 0;
+                }
+                pthread_mutex_unlock(&lock);
                 break;
         }
         free(req);
         io_uring_cqe_seen(&client_ring[i], cqe);
     }
+    return;
+}
+
+void sigint_handler(int signo) {
+    printf("^C pressed. Shutting down.\n");
+    for(int i = 0; i < total_threads; ++i)
+        io_uring_queue_exit(&client_ring[i]);
+    exit(0);
+}
+
+void *client_thread(void *p) {
+    int i = (int)(intptr_t)p;
+
+    server_loop(i);
     return NULL;
 }
 
+/*
 void *liburing_thread(void *p) {
     int i = (int)(intptr_t)p;
 
@@ -588,6 +577,7 @@ void *liburing_thread(void *p) {
     }
     return NULL;
 }
+*/
 
 
 int main(int argc, char*argv[]) {
@@ -601,30 +591,30 @@ int main(int argc, char*argv[]) {
     if (argc > 3)
       total_sockets = total_threads * atoi(argv[3]);
 
+    pthread_mutex_init(&lock, NULL);
+
     check_for_index_file();
-    server_socket = setup_listening_socket(server_port);
-    printf("ZeroHTTPd listening on port: %d\n", server_port);
+    open_index_file("public/index.html");
 
     signal(SIGINT, sigint_handler);
+    nice(100);
 
-    client_ring = (struct io_uring*)malloc((1 + total_threads) * sizeof(struct io_uring));
-    liburing_queues = (struct mpscq **)malloc((1 + total_threads) * sizeof(struct mpscq *));
-    pthread_t pt;
-    for(int i = 0; i <= total_threads; ++i) {
-        io_uring_queue_init(QUEUE_DEPTH, &client_ring[i], 0);
-        pthread_create(&pt, NULL, client_thread, (void *)(intptr_t)i);
-#if SUBMIT_IN_SPERATE_THREAD
-        liburing_queues[i] = mpscq_create(NULL, total_sockets * pow(2, 3));
-        pthread_create(&pt, NULL, liburing_thread, (void *)(intptr_t)i);
-#endif
+    client_ring = (struct io_uring*)malloc(total_threads * sizeof(struct io_uring));
+    server_socket = (int *)malloc(total_threads * sizeof(int));
+
+    if(total_threads > 1) {
+        pthread_t pt;
+        for(int i = 0; i < total_threads; ++i) {
+            io_uring_queue_init(QUEUE_DEPTH, &client_ring[i], 0);
+            pthread_create(&pt, NULL, client_thread, (void *)(intptr_t)i);
+        }
+
+        while(1)
+            sleep(10);
+    } else {
+        io_uring_queue_init(QUEUE_DEPTH, &client_ring[0], 0);
+        server_loop(0);
     }
-
-    struct sockaddr_in client_addr;
-    socklen_t client_addr_len = sizeof(client_addr);
-    add_accept_request(server_socket, &client_addr, &client_addr_len);
-
-    while(1) sleep(1);
-    //server_loop();
 
     return 0;
 }
