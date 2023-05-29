@@ -31,7 +31,10 @@ liburing_threaded: 08_liburing_threaded/main.c libmpscq.a
 liburing: 09_liburing/main.c
                 gcc -g -o $@ $< -lpthread -luring
 
-all: iterative forking preforked threaded prethreaded poll epoll libmpscq.a liburing_threaded liburing
+client: client.c
+        gcc -o $@ $<
+
+all: iterative forking preforked threaded prethreaded poll epoll libmpscq.a liburing_threaded liburing client
 
 .PHONY: clean
 
