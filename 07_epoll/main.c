@@ -484,6 +484,11 @@ int setup_listening_socket(int port) {
 
     int enable = 1;
     if (setsockopt(sock,
+                   SOL_SOCKET, SO_REUSEPORT,
+                   &enable, sizeof(int)) < 0)
+        fatal_error("setsockopt(SO_REUSEPORT)");
+    enable = 1;
+    if (setsockopt(sock,
                    SOL_SOCKET, SO_REUSEADDR,
                    &enable, sizeof(int)) < 0)
         fatal_error("setsockopt(SO_REUSEADDR)");
@@ -502,7 +507,7 @@ int setup_listening_socket(int port) {
              sizeof(srv_addr)) < 0)
         fatal_error("bind()");
 
-    if (listen(sock, 10) < 0)
+    if (listen(sock, 10000) < 0)
         fatal_error("listen()");
 
     return (sock);
